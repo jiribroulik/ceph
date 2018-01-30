@@ -1892,9 +1892,9 @@ class DevicePartition(object):
                 (dev is not None and is_mpath(dev))):
             partition = DevicePartitionMultipath(args)
         elif dmcrypt_type == 'luks':
-            partition = DevicePartitionCryptLuks(args)
+            partition = DevicePartitionCryptLuks(name, args)
         elif dmcrypt_type == 'plain':
-            partition = DevicePartitionCryptPlain(args)
+            partition = DevicePartitionCryptPlain(name, args)
         else:
             partition = DevicePartition(args)
         partition.set_dev(dev)
@@ -1909,13 +1909,13 @@ class DevicePartitionMultipath(DevicePartition):
 
 class DevicePartitionCrypt(DevicePartition):
 
-    def __init__(self, args):
+    def __init__(self, name, args):
         super(DevicePartitionCrypt, self).__init__(args)
         self.osd_dm_key = None
         self.cryptsetup_parameters = CryptHelpers.get_cryptsetup_parameters(
             self.args)
-        self.dmcrypt_type = CryptHelpers.get_dmcrypt_type(None, self.args)
-        self.dmcrypt_keysize = CryptHelpers.get_dmcrypt_keysize(self.args)
+        self.dmcrypt_type = CryptHelpers.get_dmcrypt_type(name, self.args)
+        self.dmcrypt_keysize = CryptHelpers.get_dmcrypt_keysize(name, self.args)
 
     def setup_crypt(self):
         pass
@@ -2028,6 +2028,21 @@ class Prepare(object):
             '--journal-non-dmcrypt',
             action='store_true', default=None,
             help='do not dmcrypt JOURNAL devices',
+        )
+        parser.add_argument(
+            '--journal-dmcrypt',
+            action='store_true', default=None,
+            help='dmcrypt JOURNAL devices',
+        )
+        parser.add_argument(
+            '--block-db-dmcrypt',
+            action='store_true', default=None,
+            help='dmcrypt block.db devices',
+        )
+        parser.add_argument(
+            '--block-wal-dmcrypt',
+            action='store_true', default=None,
+            help='dmcrypt block.wal devices',
         )
         parser.add_argument(
             '--block-db-non-dmcrypt',
@@ -2176,8 +2191,11 @@ class PrepareFilestore(Prepare):
 
     def __init__(self, args):
         super(PrepareFilestore, self).__init__(args)
-        if args.dmcrypt:
+        if args.dmcrypt or args.journal_dmcrypt:
+            self.dmcrypt = True
             self.lockbox = Lockbox(args)
+        else:
+            self.dmcrypt = False
         self.data = PrepareFilestoreData(args)
         self.journal = PrepareJournal(args)
 
@@ -2188,7 +2206,7 @@ class PrepareFilestore(Prepare):
         ]
 
     def _prepare(self):
-        if self.data.args.dmcrypt:
+        if self.data.args.dmcrypt or self.dmcrypt:
             self.lockbox.prepare()
         self.data.prepare(self.journal)
 
@@ -2197,8 +2215,11 @@ class PrepareBluestore(Prepare):
 
     def __init__(self, args):
         super(PrepareBluestore, self).__init__(args)
-        if args.dmcrypt:
+        if args.dmcrypt or args.block_db_dmcrypt or args.block_wal_dmcrypt:
+            self.dmcrypt = True
             self.lockbox = Lockbox(args)
+        else:
+            self.dmcrypt = False
         self.data = PrepareBluestoreData(args)
         self.block = PrepareBluestoreBlock(args)
         self.blockdb = PrepareBluestoreBlockDB(args)
@@ -2231,7 +2252,7 @@ class PrepareBluestore(Prepare):
         ]
 
     def _prepare(self):
-        if self.data.args.dmcrypt:
+        if self.data.args.dmcrypt or self.dmcrypt:
             self.lockbox.prepare()
         to_prepare_list = []
         if getattr(self.data.args, 'block.db'):
@@ -2454,7 +2475,12 @@ class PrepareSpace(object):
             LOG.info('not encrypting block.wal')
         elif 'journal' in self.name and self.args.journal_non_dmcrypt:
             LOG.info('not encrypting journal')
-        elif self.args.dmcrypt:
+        elif (
+                ('journal' in self.name and self.args.journal_dmcrypt and self.args.dmcrypt is None) or
+                ('block.db' in self.name and self.args.block_db_dmcrypt and self.args.dmcrypt is None) or
+                ('block.wal' in self.name and self.args.block_wal_dmcrypt and self.args.dmcrypt is None) or
+                (self.args.dmcrypt)
+            ):
             self.space_dmcrypt = self.space_symlink
             self.space_symlink = '/dev/mapper/{uuid}'.format(
                 uuid=getattr(self.args, self.name + '_uuid'))
@@ -2678,12 +2704,12 @@ class CryptHelpers(object):
             return shlex.split(cryptsetup_parameters_str)
 
     @staticmethod
-    def get_dmcrypt_keysize(args):
+    def get_dmcrypt_keysize(name, args):
         dmcrypt_keysize_str = get_conf(
             cluster=args.cluster,
             variable='osd_dmcrypt_key_size',
         )
-        dmcrypt_type = CryptHelpers.get_dmcrypt_type(None, args)
+        dmcrypt_type = CryptHelpers.get_dmcrypt_type(name, args)
         if dmcrypt_type == 'luks':
             if dmcrypt_keysize_str is None:
                 # As LUKS will hash the 'passphrase' in .luks.key
@@ -2709,14 +2735,21 @@ class CryptHelpers(object):
 
     @staticmethod
     def get_dmcrypt_type(name, args):
-        LOG.info(name)
-        if 'block.db' in str(name) and hasattr(args, 'dmcrypt') and args.dmcrypt and hasattr(args, 'block_db_non_dmcrypt') and args.block_db_non_dmcrypt:
+        if (
+                ('block.db' in str(name) and hasattr(args, 'dmcrypt') and args.dmcrypt and hasattr(args, 'block_db_non_dmcrypt') and args.block_db_non_dmcrypt) or
+                ('block.wal' in str(name) and hasattr(args, 'dmcrypt') and args.dmcrypt and hasattr(args, 'block_wal_non_dmcrypt') and args.block_wal_non_dmcrypt) or
+                ('journal' in str(name) and hasattr(args, 'dmcrypt') and args.dmcrypt and hasattr(args, 'journal_non_dmcrypt') and args.journal_non_dmcrypt)
+            ):
             return None
-        if 'block.wal' in str(name) and hasattr(args, 'dmcrypt') and args.dmcrypt and hasattr(args, 'block_wal_non_dmcrypt') and args.block_wal_non_dmcrypt:
-            return None
-        if 'journal' in str(name) and hasattr(args, 'dmcrypt') and args.dmcrypt and hasattr(args, 'journal_non_dmcrypt') and args.journal_non_dmcrypt:
-            return None
-        if hasattr(args, 'dmcrypt') and args.dmcrypt:
+        elif (
+                (hasattr(args, 'dmcrypt') and args.dmcrypt) or
+                ('journal' in str(name) and hasattr(args, 'journal_dmcrypt') and args.journal_dmcrypt) or
+                ('block.db' in str(name) and hasattr(args, 'block_db_dmcrypt') and args.block_db_dmcrypt) or
+                ('block.wal' in str(name) and hasattr(args, 'block_wal_dmcrypt') and args.block_wal_dmcrypt) or
+                ('lockbox' in str(name) and hasattr(args, 'journal_dmcrypt') and args.journal_dmcrypt) or
+                ('lockbox' in str(name) and hasattr(args, 'block_db_dmcrypt') and args.block_db_dmcrypt) or
+                ('lockbox' in str(name) and hasattr(args, 'block_wal_dmcrypt') and args.block_wal_dmcrypt)
+            ):
             dmcrypt_type = get_conf(
                 cluster=args.cluster,
                 variable='osd_dmcrypt_type',
@@ -2759,10 +2792,10 @@ class Secrets(object):
 
 class LockboxSecrets(Secrets):
 
-    def __init__(self, args):
+    def __init__(self, name, args):
         super(LockboxSecrets, self).__init__()
 
-        key_size = CryptHelpers.get_dmcrypt_keysize(args)
+        key_size = CryptHelpers.get_dmcrypt_keysize(name, args)
         key = open('/dev/urandom', 'rb').read(key_size / 8)
         base64_key = base64.b64encode(key).decode('ascii')
 
@@ -2793,6 +2826,7 @@ class Lockbox(object):
         self.args = args
         self.partition = None
         self.device = None
+        self.name = 'lockbox'
 
         if hasattr(self.args, 'lockbox') and self.args.lockbox is None:
             self.args.lockbox = self.args.data
@@ -2847,7 +2881,7 @@ class Lockbox(object):
         bootstrap = self.args.prepare_key_template.format(cluster=cluster,
                                                           statedir=STATEDIR)
         path = self.get_mount_point()
-        secrets = LockboxSecrets(self.args)
+        secrets = LockboxSecrets(self.name, self.args)
         id_arg = self.args.osd_id and [self.args.osd_id] or []
         osd_id = command_with_stdin(
             [
